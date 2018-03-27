@@ -5,11 +5,17 @@ from enum import Enum, auto
 
 import numpy as np
 
-from planning_utils import a_star, heuristic, create_grid
+from planning_utils import heuristic, a_star_graph, create_grid_and_edges, nearest_point, prune_path
 from udacidrone import Drone
 from udacidrone.connection import MavlinkConnection
 from udacidrone.messaging import MsgID
 from udacidrone.frame_utils import global_to_local
+
+import matplotlib.pyplot as plt
+
+import pkg_resources
+pkg_resources.require("networkx==2.1")
+import networkx as nx
 
 
 class States(Enum):
@@ -114,18 +120,21 @@ class MotionPlanning(Drone):
     def plan_path(self):
         self.flight_state = States.PLANNING
         print("Searching for a path ...")
-        TARGET_ALTITUDE = 5
-        SAFETY_DISTANCE = 5
+        TARGET_ALTITUDE = 10
+        SAFETY_DISTANCE = 2
 
         self.target_position[2] = TARGET_ALTITUDE
 
-        # TODO: read lat0, lon0 from colliders into floating point values
-        
-        # TODO: set home position to (lon0, lat0, 0)
+        # read lat0, lon0 from colliders into floating point values
+        first_line = open('colliders.csv').readline()
+        lat_lon = dict(val.strip().split(' ') for val in first_line.split(','))
 
-        # TODO: retrieve current global position
- 
-        # TODO: convert to current local position using global_to_local()
+        # set home position to (lon0, lat0, 0)
+        self.set_home_position(float(lat_lon['lon0']), float(lat_lon['lat0']), 0)
+        
+        # retrieve current global position
+        # convert to current local position using global_to_local()
+        local_position = global_to_local(self.global_position, self.global_home)
         
         print('global home {0}, position {1}, local position {2}'.format(self.global_home, self.global_position,
                                                                          self.local_position))
@@ -133,31 +142,87 @@ class MotionPlanning(Drone):
         data = np.loadtxt('colliders.csv', delimiter=',', dtype='Float64', skiprows=2)
         
         # Define a grid for a particular altitude and safety margin around obstacles
-        grid, north_offset, east_offset = create_grid(data, TARGET_ALTITUDE, SAFETY_DISTANCE)
+        # Create Voronoi graph from obstacles
+        grid, edges, north_offset, east_offset = create_grid_and_edges(data, TARGET_ALTITUDE, SAFETY_DISTANCE)
         print("North offset = {0}, east offset = {1}".format(north_offset, east_offset))
-        # Define starting point on the grid (this is just grid center)
-        grid_start = (-north_offset, -east_offset)
-        # TODO: convert start position to current position rather than map center
+        
+        # Define starting point on the grid
+        # convert start position to current position rather than map center
+        grid_start = (-north_offset + int(local_position[0]), -east_offset + int(local_position[1]))
         
         # Set goal as some arbitrary position on the grid
-        grid_goal = (-north_offset + 10, -east_offset + 10)
-        # TODO: adapt to set goal as latitude / longitude position and convert
+        # adapt to set goal as latitude / longitude position and convert
 
-        # Run A* to find a path from start to goal
-        # TODO: add diagonal motions with a cost of sqrt(2) to your A* implementation
-        # or move to a different search space such as a graph (not done here)
-        print('Local Start and Goal: ', grid_start, grid_goal)
-        path, _ = a_star(grid, heuristic, grid_start, grid_goal)
+        # some possible destinations on the map
+        destinations = [ [-122.39324423, 37.79607305], 
+                         [-122.39489652, 37.79124152], 
+                         [-122.40059743, 37.79272177], 
+                         [-122.39625334, 37.79478161] ]
         
-        # TODO: prune path to minimize number of waypoints
-        # TODO (if you're feeling ambitious): Try a different approach altogether!
+        # randomly choose one of destinations
+        destination = destinations[np.random.randint(0, len(destinations))]
+        destination_local = global_to_local([destination[0], destination[1], TARGET_ALTITUDE], self.global_home)
+
+        # adjust destination coordinates on the grid
+        grid_goal = (-north_offset + int(destination_local[0]), -east_offset + int(destination_local[1]))
+
+        print('Local Start and Goal: ', grid_start, grid_goal)
+       
+        # create Voronoi graph with the weight of the edges
+        # set to the Euclidean distance between the points
+        voronoi_graph = nx.Graph()
+
+        for e in edges:
+            p1 = e[0]
+            p2 = e[1]
+            dist = np.linalg.norm(np.array(p2) - np.array(p1))
+            voronoi_graph.add_edge(p1, p2, weight=dist )
+
+        # find the nearest points on the graph for start and the goal
+        voronoi_start = nearest_point(grid_start, voronoi_graph)
+        voronoi_finish = nearest_point(grid_goal, voronoi_graph)
+
+        # run A-star on the graph
+        voronoi_path, voronoi_cost = a_star_graph(voronoi_graph, heuristic, voronoi_start, voronoi_finish)
+        voronoi_path.append(grid_goal)
+
+        # prune path - from Lesson 6.5
+        print('Original path len: ', len(voronoi_path))
+        voronoi_path = prune_path(voronoi_path)
+        print('Pruned path len: ', len(voronoi_path))
 
         # Convert path to waypoints
-        waypoints = [[p[0] + north_offset, p[1] + east_offset, TARGET_ALTITUDE, 0] for p in path]
+        waypoints = [[int(p[0]) + north_offset, int(p[1]) + east_offset, TARGET_ALTITUDE, 0] for p in voronoi_path]
+
         # Set self.waypoints
         self.waypoints = waypoints
-        # TODO: send waypoints to sim
+        
+        # send waypoints to sim
         self.send_waypoints()
+
+        ## Uncomment this to plot the graph and path #####################################
+        #plt.rcParams['figure.figsize'] = 12, 12
+        #plt.imshow(grid, origin='lower', cmap='Greys') 
+        #
+        ## graph
+        #for e in edges:
+        #    p1 = e[0]
+        #    p2 = e[1]
+        #    plt.plot([p1[1], p2[1]], [p1[0], p2[0]], 'b-')
+        #
+        ## path
+        #for e in voronoi_path:
+        #    plt.plot(e[1], e[0], 'go')
+        #
+        ## start and goal 
+        #plt.plot(grid_start[1], grid_start[0], 'bo')
+        #plt.plot(grid_goal[1], grid_goal[0], 'ro')
+        #
+        #plt.xlabel('EAST')
+        #plt.ylabel('NORTH')
+        #plt.show()
+        ###################################################################################
+
 
     def start(self):
         self.start_log("Logs", "NavLog.txt")
